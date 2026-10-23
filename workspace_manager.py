@@ -7,6 +7,7 @@
 import os
 import sys
 import json
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -66,19 +67,73 @@ class WorkspaceManager:
         with open(self.config_file, 'w', encoding='utf-8') as f:
             json.dump(self.config, f, indent=2, ensure_ascii=False)
 
-    def _infer_project_name(self, description):
-        """从任务描述推断项目名称"""
-        # 移除常见动词和虚词
-        words = description.split()
-        stop_words = {'帮我', '写一个', '创建', '做一个', '实现', '开发', '的', '来', '用于', '以便'}
-        keywords = [w for w in words if w not in stop_words and len(w) > 1]
+    def _workspace_path(self, name):
+        """Return a direct child workspace path; reject traversal and symlinks out."""
+        if not isinstance(name, str) or not name or name != name.strip():
+            raise ValueError("工作空间名称不能为空，且不能带首尾空白")
+        if name in {".", ".."} or "/" in name or "\\" in name or Path(name).name != name:
+            raise ValueError("工作空间名称必须是单个目录名，不能包含路径分隔符")
+        root = self.work_dir.resolve()
+        candidate = (self.work_dir / name).resolve()
+        if candidate.parent != root:
+            raise ValueError("工作空间路径必须位于 .claude-work 目录内")
+        return self.work_dir / name
 
-        if keywords:
-            name = ''.join(keywords[:3])
+    def _infer_project_name(self, description):
+        """通过明确的中文任务模板推断简短名称；不声称进行自然语言理解。"""
+        text = str(description or "").strip()
+        if text:
+            text = re.sub(r"[\r\n\t]+", " ", text)
+            text = re.sub(r"[，。！？,!?；;：:]+", "", text)
+            text = re.sub(r"^(?:请)?(?:帮我|帮忙|给我|为我)?\s*", "", text).strip()
+            text = re.sub(
+                r"^(?:写|编写|创建|做|实现|开发|构建|搭建|设计|生成|制作)"
+                r"\s*(?:一个|一套|一份|一款)?\s*",
+                "",
+                text,
+            ).strip()
+
+            # “处理CSV的脚本” -> “CSV处理脚本”
+            match = re.search(
+                r"(?P<action>处理|分析|修复|优化|整理|总结|提取|转换)"
+                r"\s*(?P<object>.+?)(?:的)?"
+                r"(?P<kind>脚本|程序|工具|应用|系统|模块|组件)",
+                text,
+            )
+            if match:
+                name = match.group("object") + match.group("action") + match.group("kind")
+            else:
+                # “Python脚本来处理CSV文件” -> “CSV处理脚本”
+                match = re.search(
+                    r"(?P<kind>脚本|程序|工具|应用|系统|模块|组件)"
+                    r"(?:来|用于|以便)?"
+                    r"(?P<action>处理|分析|修复|优化|整理|总结|提取|转换)"
+                    r"\s*(?P<object>.+?)(?:文件|数据)?$",
+                    text,
+                )
+                if match:
+                    name = match.group("object") + match.group("action") + match.group("kind")
+                else:
+                    # “分析销售数据” -> “销售数据分析”；“修复认证bug” -> “认证bug修复”
+                    match = re.match(
+                        r"^(?P<action>分析|修复|优化|整理|总结|处理|提取|转换)"
+                        r"\s*(?P<object>.+)$",
+                        text,
+                    )
+                    if match:
+                        name = match.group("object") + match.group("action")
+                    else:
+                        name = re.split(r"(?:用于|以便)", text, maxsplit=1)[0].strip()
+
+            name = re.sub(r"\s+", "-", name.strip())
+            name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", name)
+            name = re.sub(r"-+", "-", name).strip(" .-_")
+            if not name or name in {".", ".."}:
+                name = "项目"
+            name = name[:40].rstrip(" .-_") or "项目"
         else:
             name = "项目"
 
-        # 添加日期后缀
         date_str = datetime.now().strftime("%Y%m%d")
         return f"{name}-{date_str}"
 
@@ -108,7 +163,7 @@ class WorkspaceManager:
             else:
                 name = f"项目-{datetime.now().strftime('%Y%m%d')}"
 
-        workspace_path = self.work_dir / name
+        workspace_path = self._workspace_path(name)
 
         # 创建目录结构
         directories = [
@@ -130,12 +185,12 @@ class WorkspaceManager:
     def get_active_workspace(self):
         """获取当前活跃的工作空间路径"""
         if self.state["active_workspace"]:
-            return self.work_dir / self.state["active_workspace"]
+            return self._workspace_path(self.state["active_workspace"])
         return None
 
     def switch_workspace(self, name):
         """切换到指定的工作空间"""
-        workspace_path = self.work_dir / name
+        workspace_path = self._workspace_path(name)
         if workspace_path.exists():
             self.state["active_workspace"] = name
             self._save_state()
@@ -161,7 +216,7 @@ class WorkspaceManager:
         if name is None:
             return None
 
-        workspace_path = self.work_dir / name
+        workspace_path = self._workspace_path(name)
         if not workspace_path.exists():
             return None
 
@@ -190,7 +245,7 @@ class WorkspaceManager:
             print("错误：没有活跃的工作空间")
             return None
 
-        workspace_path = self.work_dir / name
+        workspace_path = self._workspace_path(name)
         if not workspace_path.exists():
             print(f"错误：工作空间 '{name}' 不存在")
             return None
@@ -224,7 +279,10 @@ class WorkspaceManager:
             print("错误：没有活跃的工作空间")
             return False
 
-        temp_dir = self.work_dir / name / "temp"
+        workspace_path = self._workspace_path(name)
+        temp_dir = workspace_path / "temp"
+        if temp_dir.is_symlink():
+            raise ValueError("temp 目录不能是符号链接")
         if temp_dir.exists():
             for item in temp_dir.iterdir():
                 if item.is_file():
@@ -241,8 +299,21 @@ class WorkspaceManager:
         if workspace_name is None:
             return None
 
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or filename in {".", ".."}
+            or "/" in filename
+            or "\\" in filename
+            or Path(filename).name != filename
+        ):
+            raise ValueError("文件名必须是单个文件名，不能包含路径分隔符")
+
         category = self._categorize_file(filename)
-        workspace_path = self.work_dir / workspace_name / category
+        workspace_root = self._workspace_path(workspace_name)
+        workspace_path = workspace_root / category
+        if workspace_path.is_symlink():
+            raise ValueError("分类目录不能是符号链接")
         return workspace_path / filename
 
 
@@ -329,4 +400,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        sys.exit(2)
